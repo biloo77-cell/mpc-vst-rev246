@@ -19,7 +19,7 @@ the spirit of a mid-80s studio unit, to Akai MPC OS standalone devices as a VST2
 |---|---|
 | ![REVERB page](docs/img/rev246-reverb.png) | ![SETUP page](docs/img/rev246-setup.png) |
 
-(Skin previews rendered offline; the outlined boxes show the values on the device.)
+(On an MPC Live, MPC OS 3.10.1.)
 
 ## Install
 Download the zip for your MPC from [Releases](../../releases): `-mpc-armv7` for Gen1 (Live, Live II, One, X, Key 61/37,
