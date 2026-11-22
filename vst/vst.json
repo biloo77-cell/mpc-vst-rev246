@@ -1,0 +1,20 @@
+{
+  "name": "REV-246",
+  "vendor": "OpenMPC",
+  "uid": "Rv46",
+  "version": 1000,
+  "so": "rev246.so",
+  "params": "params.json",
+  "effect": true,
+  "layout": "layout.conf",
+  "art": "html",
+  "presets": "presets.json",
+  "targets": ["armv7", "aarch64"],
+  "build": {
+    "root": "..",
+    "sources": ["src/engine.cpp"],
+    "cflags": ["-std=gnu++17", "-Isrc/shim", "-Isrc/opt", "-Iupstream/plugin/src", "-O3", "-fno-math-errno"],
+    "cflags_arm": ["-mfpu=neon-vfpv4", "-mtune=cortex-a17"],
+    "libs": ["-lm"]
+  }
+}

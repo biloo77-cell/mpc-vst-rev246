@@ -1,0 +1,302 @@
+// MPC PORT: upstream's dsp/engine/BridgeFilter.h, found before upstream's copy on the include path (VENDORED.md,
+// Speed-ups). Added: a single-precision head for the device's NEON unit (headF, tableF). Everything else is upstream's.
+#pragma once
+
+#include <juce_core/juce_core.h>
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <complex>
+#include <vector>
+
+namespace rv::dsp
+{
+// One analogue filter of the unit's chain, discretised exactly for band-limited signals (DeviceBridge's building block).
+//
+// The filter is given as partial fractions h(t) = sum_j w_j Re{R_j e^(p_j t)} (t >= 0; one entry per real pole, w = 1,
+// or conjugate pair, w = 2). It runs over samples x[m] at spacing `unit` and is read at arbitrary instants. The samples
+// stand for a band-limited signal through phi, a Kaiser-windowed sinc at the HOST Nyquist frequency (half-width W, flat to
+// about 1e-6 up to 12.8 kHz); phi is the host's continuous signal on the input side and the capture's anti-alias low-pass on
+// the output side. The response to x at time t is then sum_m x[m] k(t - t_m), k = unit * (h * phi), and since phi has
+// finite support, k(t) is a sum of pure exponentials for t >= W:
+//  - head: the last few samples (|t - t_m| < W plus up to one sample) through a tabulated k, linear between phases;
+//  - tail: every older sample through one recursion per mode, q_j = e^(p_j unit) q_j + x, read with e^(p_j u unit),
+//    u the fractional position, from a table and a short Taylor series.
+// Nothing is truncated: the result is the analogue filter's exact response to phi's signal, to the table's precision
+// (about -115 dB). State and arithmetic are double: the two 12.1 kHz pole pairs of the input filter almost coincide and
+// their modes cancel by about 50 dB.
+class BridgeFilter
+{
+  public:
+    struct Mode
+    {
+        std::complex<double> pole, residue; // rad/s, 1/s
+        int weight = 1;                     // 2 for a conjugate pair
+    };
+    static constexpr int maxModes = 12;
+
+    struct State
+    {
+        std::array<double, maxModes> re{}, im{};
+        void clear()
+        {
+            re.fill(0.0);
+            im.fill(0.0);
+        }
+    };
+
+    // phiHalf: phi's half-width (s); hostT: the host sample period (phi's sinc spacing); phases: table rows per unit;
+    // gain: a scale for the whole filter. Not real-time.
+    void build(const std::vector<Mode>& modes, double unit, double hostT, double phiHalf, double beta, int phases, double gain)
+    {
+        jassert(modes.size() <= (size_t)maxModes);
+        using C = std::complex<double>;
+        numModes = (int)modes.size();
+        numPhases = std::max(8, phases);
+        half = std::max(1, (int)std::ceil(phiHalf / unit - 1e-9));
+        const auto taps = 2 * half;
+        const auto pi = juce::MathConstants<double>::pi;
+
+        // phi (1/s) on a grid of step unit / (2 P) over [-half, half] units; Simpson's rule on pairs of steps.
+        const auto dt = unit / (2.0 * numPhases);
+        const auto numGrid = 4 * half * numPhases;
+        const auto i0Beta = besselI0(beta);
+        std::vector<double> phi((size_t)numGrid + 1);
+        for (int g = 0; g <= numGrid; ++g)
+        {
+            const auto sigma = -half * unit + g * dt;
+            const auto r = sigma / phiHalf;
+            if (std::abs(r) >= 1.0)
+                continue;
+            const auto x = sigma / hostT;
+            const auto sinc = juce::exactlyEqual(x, 0.0) ? 1.0 : std::sin(pi * x) / (pi * x);
+            phi[(size_t)g] = sinc * besselI0(beta * std::sqrt(1.0 - r * r)) / i0Beta / hostT;
+        }
+
+        // k(t) = sum_j w_j Re{R_j e^(p_j t) F_j(t)}, F_j(t) = int_{-W}^{t} e^(-p_j s) phi(s) ds, on the even grid points.
+        const auto numK = 2 * half * numPhases;
+        std::vector<double> kappa((size_t)numK + 1, 0.0);
+        std::array<C, maxModes> phiHat{};
+        for (int j = 0; j < numModes; ++j)
+        {
+            const auto& m = modes[(size_t)j];
+            auto f = [&](int g) { return std::exp(-m.pole * (-half * unit + g * dt)) * phi[(size_t)g]; };
+            C F(0.0, 0.0);
+            auto fPrev = f(0);
+            for (int i = 0; i <= numK; ++i)
+            {
+                if (i > 0)
+                {
+                    const auto fMid = f(2 * i - 1), fNext = f(2 * i);
+                    F += dt / 3.0 * (fPrev + 4.0 * fMid + fNext);
+                    fPrev = fNext;
+                }
+                const auto t = -half * unit + i * (unit / numPhases);
+                kappa[(size_t)i] += m.weight * (m.residue * std::exp(m.pole * t) * F).real();
+            }
+            phiHat[(size_t)j] = F; // phi's transform at -p_j: the tail's weight
+        }
+
+        // Head table, rows ph = 0..P (u = ph / P), taps oldest first: k((u + half - 1 - tap) * unit).
+        table.assign((size_t)(numPhases + 1) * (size_t)taps, 0.0);
+        for (int ph = 0; ph <= numPhases; ++ph)
+            for (int tap = 0; tap < taps; ++tap)
+                table[(size_t)(ph * taps + tap)] = gain * unit * kappa[(size_t)(ph + (taps - 1 - tap) * numPhases)];
+        tableF.assign(table.begin(), table.end());
+
+        // Tail: the sample `half` units before the read-out instant and older, through the modes.
+        expTable.assign((size_t)numModes * (expSteps + 1) * 2, 0.0);
+        for (int j = 0; j < numModes; ++j)
+        {
+            const auto& m = modes[(size_t)j];
+            const auto c = gain * unit * m.weight * m.residue * phiHat[(size_t)j] * std::exp(m.pole * (half * unit));
+            for (int k = 0; k <= expSteps; ++k)
+            {
+                const auto e = c * std::exp(m.pole * (unit * k / expSteps));
+                expTable[(size_t)((j * (expSteps + 1) + k) * 2)] = e.real();
+                expTable[(size_t)((j * (expSteps + 1) + k) * 2 + 1)] = e.imag();
+            }
+            const auto a = std::exp(m.pole * unit);
+            aRe[(size_t)j] = a.real();
+            aIm[(size_t)j] = a.imag();
+            const auto z = m.pole * (unit / expSteps);
+            zRe[(size_t)j] = z.real();
+            zIm[(size_t)j] = z.imag();
+        }
+    }
+
+    // Head taps either side of the read-out instant: the head reads 2 * halfTaps() samples.
+    int halfTaps() const { return half; }
+
+    // The head: x holds the 2 * halfTaps() samples around the instant, oldest first; the instant is u (0 <= u < 1) units
+    // after the (halfTaps() - 1)-th of them.
+    double head(const double* x, double u) const
+    {
+        const auto taps = 2 * half;
+        const auto pos = u * numPhases;
+        const auto ph = std::min((int)pos, numPhases - 1);
+        const auto alpha = pos - ph;
+        const auto* r0 = table.data() + (size_t)(ph * taps);
+        const auto* r1 = r0 + taps;
+        // Two partial sums per row (taps is even): independent add chains (see dotProduct, ProgramCore.h).
+        double s0a = 0.0, s0b = 0.0, s1a = 0.0, s1b = 0.0;
+        for (int k = 0; k < taps; k += 2)
+        {
+            s0a += x[k] * r0[k];
+            s0b += x[k + 1] * r0[k + 1];
+            s1a += x[k] * r1[k];
+            s1b += x[k + 1] * r1[k + 1];
+        }
+        const auto s0 = s0a + s0b, s1 = s1a + s1b;
+        return s0 + alpha * (s1 - s0);
+    }
+
+    // MPC PORT: head() in single precision on float samples, both table rows in one pass (NEON where available). The
+    // head is a short direct convolution, so float costs about 1e-7 of its own output, not the cancellation of the
+    // tail's nearly equal modes (those stay double). The rows are interpolated in double, as head().
+    double headF(const float* x, double u) const
+    {
+        const auto taps = 2 * half;
+        const auto pos = u * numPhases;
+        const auto ph = std::min((int)pos, numPhases - 1);
+        const auto alpha = pos - ph;
+        const float* r0 = tableF.data() + (size_t)(ph * taps);
+        const float* r1 = r0 + taps;
+        float s0, s1;
+        int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+        for (; k + 4 <= taps; k += 4)
+        {
+            const float32x4_t xv = vld1q_f32(x + k);
+            a0 = vmlaq_f32(a0, xv, vld1q_f32(r0 + k));
+            a1 = vmlaq_f32(a1, xv, vld1q_f32(r1 + k));
+        }
+        const float32x2_t p = vpadd_f32(vadd_f32(vget_low_f32(a0), vget_high_f32(a0)),
+                                        vadd_f32(vget_low_f32(a1), vget_high_f32(a1)));
+        s0 = vget_lane_f32(p, 0);
+        s1 = vget_lane_f32(p, 1);
+#else
+        float s0a = 0.0f, s0b = 0.0f, s1a = 0.0f, s1b = 0.0f;
+        for (; k + 2 <= taps; k += 2)
+        {
+            s0a += x[k] * r0[k];
+            s0b += x[k + 1] * r0[k + 1];
+            s1a += x[k] * r1[k];
+            s1b += x[k + 1] * r1[k + 1];
+        }
+        s0 = s0a + s0b;
+        s1 = s1a + s1b;
+#endif
+        for (; k < taps; ++k)
+        {
+            s0 += x[k] * r0[k];
+            s1 += x[k] * r1[k];
+        }
+        return (double)s0 + alpha * ((double)s1 - (double)s0);
+    }
+
+    // Feeds the sample `halfTaps()` units older than the head's newest into the tail recursions.
+    void push(State& s, double x) const
+    {
+        for (int j = 0; j < numModes; ++j)
+        {
+            const auto re = aRe[(size_t)j] * s.re[(size_t)j] - aIm[(size_t)j] * s.im[(size_t)j] + x;
+            s.im[(size_t)j] = aRe[(size_t)j] * s.im[(size_t)j] + aIm[(size_t)j] * s.re[(size_t)j];
+            s.re[(size_t)j] = re;
+        }
+    }
+
+    // The tail's per-mode read-out weights at one fractional position: c_j e^(p_j u unit).
+    struct Weights
+    {
+        std::array<double, maxModes> re{}, im{};
+    };
+
+    // The tail's contribution at fractional position u (as for head()).
+    double tail(const State& s, double u) const
+    {
+        Weights w;
+        tailWeights(u, w);
+        return tail(s, w);
+    }
+
+    double tail(const State& s, const Weights& w) const
+    {
+        double acc = 0.0;
+        for (int j = 0; j < numModes; ++j)
+            acc += w.re[(size_t)j] * s.re[(size_t)j] - w.im[(size_t)j] * s.im[(size_t)j];
+        return acc;
+    }
+
+    // e^(p_j du unit) per mode: the weights at u + du are the weights at u times these (not real-time).
+    Weights shift(double du) const
+    {
+        Weights f;
+        for (int j = 0; j < numModes; ++j)
+        {
+            const auto e = std::exp(std::complex<double>(zRe[(size_t)j], zIm[(size_t)j]) * (double)expSteps * du);
+            f.re[(size_t)j] = e.real();
+            f.im[(size_t)j] = e.imag();
+        }
+        return f;
+    }
+
+    // out = w x f per mode (complex).
+    void shifted(const Weights& w, const Weights& f, Weights& out) const
+    {
+        for (int j = 0; j < numModes; ++j)
+        {
+            const auto r = w.re[(size_t)j] * f.re[(size_t)j] - w.im[(size_t)j] * f.im[(size_t)j];
+            out.im[(size_t)j] = w.re[(size_t)j] * f.im[(size_t)j] + w.im[(size_t)j] * f.re[(size_t)j];
+            out.re[(size_t)j] = r;
+        }
+    }
+
+    void tailWeights(double u, Weights& w) const
+    {
+        const auto pos = u * expSteps;
+        const auto k = std::min((int)pos, expSteps - 1);
+        const auto d = pos - k;
+        for (int j = 0; j < numModes; ++j)
+        {
+            // e^(z d), z = p unit / steps, |z d| < 0.005: Taylor to the 3rd order (error < 3e-11 relative).
+            const auto zr = zRe[(size_t)j] * d, zi = zIm[(size_t)j] * d;
+            auto er = 1.0 + zr / 3.0, ei = zi / 3.0;  // 1 + z/3
+            auto tr = 1.0 + 0.5 * (zr * er - zi * ei); // 1 + z/2 (1 + z/3)
+            auto ti = 0.5 * (zr * ei + zi * er);
+            er = 1.0 + zr * tr - zi * ti; // 1 + z (...)
+            ei = zr * ti + zi * tr;
+            const auto* c = expTable.data() + (size_t)((j * (expSteps + 1) + k) * 2);
+            w.re[(size_t)j] = c[0] * er - c[1] * ei;
+            w.im[(size_t)j] = c[0] * ei + c[1] * er;
+        }
+    }
+
+  private:
+    static constexpr int expSteps = 1024;
+
+    static double besselI0(double x)
+    {
+        double sum = 1.0, term = 1.0;
+        for (int k = 1; k < 60; ++k)
+        {
+            term *= (x / (2.0 * k)) * (x / (2.0 * k));
+            sum += term;
+            if (term < 1e-18 * sum)
+                break;
+        }
+        return sum;
+    }
+
+    int numModes = 0, numPhases = 8, half = 1;
+    std::vector<double> table, expTable;
+    std::vector<float> tableF; // MPC PORT: `table` in single precision, for headF
+    std::array<double, maxModes> aRe{}, aIm{}, zRe{}, zIm{};
+};
+} // namespace rv::dsp
