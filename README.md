@@ -26,10 +26,12 @@ Download the zip for your MPC from [Releases](../../releases): `-mpc-armv7` for 
 Force), `-mpc-aarch64` for Gen2.
 
 - **MPC OS 3.10.1 and later** (Preferences, Enhancements, VST2 Support on): copy the folder
-  `portable/OpenMPC - VST - REV-246/` from the zip into `VST2 Plugins/` at the root of a drive (on a Gen1 internal
+  `portable/ikloX - VST - REV-246/` from the zip into `VST2 Plugins/` at the root of a drive (on a Gen1 internal
   drive: `/sdcard/VST2 Plugins/`), then restart MPC. Or, as root, `sh install.sh` from the unzipped folder: on 3.10.1
   and later it installs into `VST2 Plugins` by itself.
 - **Earlier MPC OS** (root needed): `sh install.sh` from the unzipped folder; see the zip's `INSTALL.md`.
+
+- **Upgrading from 1.0.0 or earlier:** the plugin folder is now `ikloX - VST - REV-246` (it was `OpenMPC - VST - REV-246`). The installer removes the old folder itself; if you copied the folder by hand, delete the old one so the plugin is not listed twice. The plugin's uid is unchanged, so saved projects keep their instances.
 
 Then add **REV-246** to a track from the plugin browser (insert effects).
 
@@ -47,6 +49,10 @@ Verdict WARN (2026-11-22, with MODE), from the sweep only: at rest both modes ar
 17.0 % p99 before each engine skipped its unused side, VENDORED.md). The sweep's p99 comes
 from MODE switching several times a second (each switch to TRUE ST resets the second engine); turning the levers
 alone cost 14.4 % p99 in ORIGINAL before MODE existed.
+
+Re-measured for 1.0.1 on the same machine (2026-11-23), unchanged within run-to-run spread: TRUE ST at rest
+12.2 % mean / 14.3 % p99, sweep 14.3 % mean / 29.1 % p99 / 34.5 % worst block. 1.0.1 changes no DSP, only the
+maker name baked into the plugin and the panel artwork.
 
 ## Build and test
 Needs Docker with arm/arm64 emulation (WSL) and a checkout of `open-mpc/mpc-vst-plugins` next to this repo:

@@ -33,9 +33,18 @@ UI = os.path.join(ROOT, "upstream", "ui")
 ART = os.path.join(VST, "art")
 MV = os.environ.get("MPC_VST", os.path.join(os.path.dirname(ROOT), "mpc-vst-plugins"))
 FONT = os.path.join(MV, "tools", "html_art", "fonts", "TitilliumWeb-Bold.ttf")
+BODONI = os.path.join(HERE, "fonts", "BodoniModa[opsz,wght].ttf")   # the author's mark (OFL, fonts/BodoniModa-OFL.txt)
+SIGMAR = os.path.join(HERE, "fonts", "Sigmar-Regular.ttf")          # its cross (OFL, fonts/Sigmar-OFL.txt)
 
 PAGE_W, PAGE_H, PAGE_Y = 1280, 628, 86   # MPC's plugin area; layout y = skin y + PAGE_Y
 MAX_STRIP = 12288                         # slider strips (NOTES.md 2026-10-07)
+# The author's mark, engraved on the bare panel where upstream's LEVEL LEDs were erased (LEVEL_ERASE below,
+# page x 40..145, y 259..602), read bottom to top, low enough to clear the bottom screw.
+SIGN = (62, 76, 86)
+SIGN_PX = 22
+SIGN_WGHT, SIGN_OPSZ = 900, 8
+SIGN_GAP = 0.10
+SIGN_X, SIGN_Y = 62, 540
 
 # ---- upstream geometry (design pixels of main.png, 3495 x 1380), from plugin/ui-layout.csv and src/ui/Design.h ----
 LEFT_END, MIX_FROM, MIX_TO = 2504, 2508, 2846   # the main panel; the right panel's left edge and MIX column
@@ -128,6 +137,43 @@ def glow(layer, radius, colour, alpha):
     out = Image.new("RGBA", layer.size, colour + (0,))
     out.putalpha(a)
     return out
+
+
+def ink_span(f, ch):
+    """(top, bottom) of a glyph's ink relative to its baseline, in px."""
+    n = max(64, f.size * 4)
+    im = Image.new("L", (n, n), 0)
+    ImageDraw.Draw(im).text((f.size, f.size * 2.5), ch, font=f, fill=255, anchor="ls")
+    b = im.getbbox()
+    return (b[1] - f.size * 2.5, b[3] - f.size * 2.5) if b else (0, 0)
+
+
+def signature_tile(px, fill):
+    """The author's mark as its own RGBA tile: "iklo" in Bodoni Moda, then a bold Sigmar cross.
+
+    Both are set at the same point size and share a baseline, so the cross stands at the height of the "k".
+    """
+    g = ImageFont.truetype(BODONI, max(4, round(px)))
+    g.set_variation_by_axes([SIGN_WGHT, SIGN_OPSZ])
+    c = ImageFont.truetype(SIGMAR, max(4, round(px)))
+    probe = ImageDraw.Draw(Image.new("L", (8, 8)))
+    word, gap = probe.textlength("iklo", font=g), px * SIGN_GAP
+    cross = probe.textlength("X", font=c)
+    pad = round(px * 0.6)
+    tile = Image.new("RGBA", (round(word + gap + cross) + 2 * pad, round(px * 2.2)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(tile)
+    k_top, k_bot = ink_span(g, "k")
+    baseline = tile.height / 2 + (k_bot - k_top) / 2
+    d.text((pad, baseline), "iklo", font=g, fill=fill, anchor="ls")
+    d.text((pad + word + gap, baseline), "X", font=c, fill=fill, anchor="ls")
+    return tile.crop(tile.getbbox() or (0, 0, 1, 1))
+
+
+def signature(bg, cx, cy, px, fill):
+    """Paste the mark on its side, reading bottom to top, centred on (cx, cy)."""
+    t = signature_tile(px, fill).rotate(90, expand=True)
+    bg.paste(t, (round(cx - t.width / 2), round(cy - t.height / 2)), t)
+
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -342,6 +388,13 @@ def page_reverb(lines):
     bg = Image.new("RGBA", (PAGE_W, PAGE_H), (13, 20, 24, 255))
     full = Box(PAGE_W / 2, PAD_Y + 1380 * S / 2, PAGE_W, 1380 * S)
     bg.alpha_composite(full.render(comp), (full.x, full.y))
+    # Upstream's panel is cropped at MIX_TO, which falls before its right-hand screws, so the MIX column
+    # would run off the page unscrewed while SETUP (whose columns are flush right) keeps its own. Paste the
+    # same screw from the artwork at the two right corners, at SETUP's 6 px inset.
+    screw = ui("main.png").crop((8, 10, 66, 68)).resize((round(58 * S), round(58 * S)), Image.LANCZOS)
+    for syp in (6, PAGE_H - screw.height - 6):
+        bg.alpha_composite(screw, (PAGE_W - screw.width - 6, syp))
+    signature(bg, SIGN_X, SIGN_Y, SIGN_PX, SIGN + (255,))
     lines.append("[tab REVERB]")
     lines.append("art file=%s fit=stretch" % save(bg.convert("RGB"), "bg_reverb.png"))
 
